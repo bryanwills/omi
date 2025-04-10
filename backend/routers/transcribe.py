@@ -329,7 +329,7 @@ async def _listen(
                     async def deepgram_socket_send(data):
                         return deepgram_socket.send(data)
 
-                    asyncio.create_task(send_initial_file_path(file_path, deepgram_socket_send))
+                    await send_initial_file_path(file_path, deepgram_socket_send)
 
             # SONIOX
             elif stt_service == STTService.soniox:
@@ -348,7 +348,7 @@ async def _listen(
                         uid if include_speech_profile else None
                     )
 
-                    asyncio.create_task(send_initial_file_path(file_path, soniox_socket.send))
+                    await send_initial_file_path(file_path, soniox_socket.send)
                     print('speech_profile soniox duration', speech_profile_duration, uid)
             # SPEECHMATICS
             elif stt_service == STTService.speechmatics:
@@ -356,7 +356,7 @@ async def _listen(
                     stream_transcript, sample_rate, stt_language, preseconds=speech_profile_duration
                 )
                 if speech_profile_duration:
-                    asyncio.create_task(send_initial_file_path(file_path, speechmatics_socket.send))
+                    await send_initial_file_path(file_path, speechmatics_socket.send)
                     print('speech_profile speechmatics duration', speech_profile_duration, uid)
 
         except Exception as e:
