@@ -1,0 +1,3 @@
+{
+  "change": "Typing with no text field focused now starts a search in the page's search bar (or lands in the chat composer on Chat) instead of playing the system alert sound"
+}
