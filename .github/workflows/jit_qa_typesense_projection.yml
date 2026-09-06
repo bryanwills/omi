@@ -146,7 +146,11 @@ jobs:
 
           smoke_name="jit-qa-typesense-smoke-${GITHUB_RUN_ID}"
           smoke_port=18108
-          smoke_key="jit-qa-typesense-local-smoke-key"
+          smoke_key="$(printf 'a%.0s' {1..64})"
+          smoke_key_raw="$RUNNER_TEMP/typesense-smoke-key.raw"
+          smoke_key_normalized="$RUNNER_TEMP/typesense-smoke-key.normalized"
+          smoke_env="$RUNNER_TEMP/typesense-smoke.env"
+          umask 077
           smoke_passed=0
           cleanup_smoke() {
             if [[ "$smoke_passed" != 1 ]] && docker inspect "$smoke_name" >/dev/null 2>&1; then
@@ -155,10 +159,33 @@ jobs:
               docker logs --tail 200 "$smoke_name" 2>&1 | sed "s/${smoke_key}/[redacted]/g" >&2 || true
             fi
             docker rm -f "$smoke_name" >/dev/null 2>&1 || true
+            rm -f "$smoke_key_raw" "$smoke_key_normalized" "$smoke_env"
           }
           trap cleanup_smoke EXIT
+          printf '%s\n' "$smoke_key" > "$smoke_key_raw"
+          # The helper intentionally returns 2 for the one repairable legacy
+          # shape. Capture that status explicitly: set -e must not turn a
+          # validated repair into an early smoke-step failure.
+          set +e
+          smoke_shape="$(python3 backend/scripts/jit_qa_typesense_key_shape.py \
+            --normalize-file "$smoke_key_raw" --output "$smoke_key_normalized")"
+          smoke_shape_status=$?
+          set -e
+          case "$smoke_shape_status:$smoke_shape" in
+            2:legacy_trailing_lf)
+              ;;
+            *)
+              echo "Typesense auth smoke did not exercise the legacy newline shape" >&2
+              exit 1
+              ;;
+          esac
+          {
+            printf 'TYPESENSE_API_KEY='
+            cat "$smoke_key_normalized"
+            printf '\nTYPESENSE_DATA_DIR=/tmp/typesense\n'
+          } > "$smoke_env"
           docker run --detach --name "$smoke_name" --publish "$smoke_port:8080" \
-            --env "TYPESENSE_API_KEY=$smoke_key" --env TYPESENSE_DATA_DIR=/tmp/typesense "$typesense_tag" >/dev/null
+            --env-file "$smoke_env" "$typesense_tag" >/dev/null
           smoke_url="http://127.0.0.1:${smoke_port}"
           for attempt in {1..30}; do
             if curl --fail --silent --show-error "$smoke_url/health" | grep -q '"ok":true'; then
@@ -215,6 +242,16 @@ jobs:
       id-token: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.admit.outputs.source_sha }}
+          fetch-depth: 1
+      - name: Verify the checked-in Typesense key-shape helper
+        run: |
+          set -euo pipefail
+          helper="backend/scripts/jit_qa_typesense_key_shape.py"
+          test -r "$helper"
+          python3 "$helper" --help >/dev/null
       - uses: google-github-actions/auth@v3
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
@@ -236,12 +273,39 @@ jobs:
       - name: Create or verify the dedicated QA Typesense key secret
         run: |
           set -euo pipefail
+          key_dir="$RUNNER_TEMP/jit-qa-typesense-key"
+          install -d -m 700 "$key_dir"
+          raw_key="$key_dir/raw"
+          normalized_key="$key_dir/normalized"
+          umask 077
+          cleanup_key_material() {
+            rm -f "$raw_key" "$normalized_key"
+            rmdir "$key_dir" 2>/dev/null || true
+          }
+          trap cleanup_key_material EXIT
           if ! gcloud secrets describe "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" >/dev/null 2>&1; then
+            # Stage and validate the exact bytes before mutating Secret
+            # Manager. Do not pipe an unvalidated generator into an upload.
+            openssl rand -hex 32 > "$raw_key"
+            chmod 600 "$raw_key"
+            set +e
+            key_shape="$(python3 backend/scripts/jit_qa_typesense_key_shape.py \
+              --normalize-file "$raw_key" --output "$normalized_key")"
+            key_shape_status=$?
+            set -e
+            case "$key_shape_status:$key_shape" in
+              0:valid|2:legacy_trailing_lf)
+                ;;
+              *)
+                echo "new Typesense key has an unexpected byte shape" >&2
+                exit 1
+                ;;
+            esac
             gcloud secrets create "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" \
               --replication-policy=user-managed --locations="$QA_REGION" \
               --labels=managed-by=github-actions,jit-qa=true --quiet
-            openssl rand -hex 32 | gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
-              --project "$QA_PROJECT" --data-file=- >/dev/null
+            gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
+              --project "$QA_PROJECT" --data-file="$normalized_key" >/dev/null
           else
             metadata="$RUNNER_TEMP/typesense-secret.json"
             gcloud secrets describe "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" --format=json > "$metadata"
@@ -254,6 +318,28 @@ jobs:
           PY
             state="$(gcloud secrets versions describe latest --secret "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" --format='value(state)')"
             [[ "$state" == "ENABLED" ]] || { echo "dedicated Typesense key has no enabled latest version" >&2; exit 1; }
+            gcloud secrets versions access latest --secret "$QA_TYPESENSE_SECRET" \
+              --project "$QA_PROJECT" --out-file="$raw_key"
+            chmod 600 "$raw_key"
+            set +e
+            key_shape="$(python3 backend/scripts/jit_qa_typesense_key_shape.py \
+              --normalize-file "$raw_key" --output "$normalized_key")"
+            key_shape_status=$?
+            set -e
+            case "$key_shape_status:$key_shape" in
+              0:valid)
+                ;;
+              2:legacy_trailing_lf)
+                # Repair only the exact historical pipe-generated shape. Any
+                # other bytes fail closed rather than guessing at a credential.
+                gcloud secrets versions add "$QA_TYPESENSE_SECRET" \
+                  --project "$QA_PROJECT" --data-file="$normalized_key" >/dev/null
+                ;;
+              *)
+                echo "dedicated Typesense key has an unexpected byte shape" >&2
+                exit 1
+                ;;
+            esac
           fi
           gcloud secrets add-iam-policy-binding "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT" \
             --member="serviceAccount:${QA_RUNTIME_SERVICE_ACCOUNT}" --role=roles/secretmanager.secretAccessor \
@@ -392,18 +478,18 @@ jobs:
           set -euo pipefail
           api_key="$(gcloud secrets versions access latest --secret "$QA_TYPESENSE_SECRET" --project "$QA_PROJECT")"
           curl --fail --silent --show-error "$TYPESENSE_URL/health" | python3 -c 'import json,sys; payload=json.load(sys.stdin); assert payload.get("ok") is True'
-          marker_status="$(curl --silent --show-error -o "$RUNNER_TEMP/typesense-marker.json" -w '%{http_code}' \
+          marker_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
             -H "X-TYPESENSE-API-KEY: $api_key" \
             "$TYPESENSE_URL/collections/jit_qa_typesense_readiness/documents/jit_qa_projection_readiness")"
           [[ "$marker_status" == "404" ]] || {
-            echo "bootstrap requires an absent readiness marker; run prove to rehydrate an existing service" >&2
+            echo "bootstrap readiness marker status=$marker_status; expected 404 (run prove to rehydrate an existing service)" >&2
             exit 1
           }
-          collection_status="$(curl --silent --show-error -o "$RUNNER_TEMP/typesense-collection.json" -w '%{http_code}' \
+          collection_status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
             -H "X-TYPESENSE-API-KEY: $api_key" \
             "$TYPESENSE_URL/collections/$QA_TYPESENSE_COLLECTION")"
           [[ "$collection_status" == "404" ]] || {
-            echo "bootstrap requires an empty projection collection; run prove to repair an existing service" >&2
+            echo "bootstrap projection collection status=$collection_status; expected 404 (run prove to repair an existing service)" >&2
             exit 1
           }
           receipt="$RUNNER_TEMP/jit-qa-typesense/bootstrap.json"
