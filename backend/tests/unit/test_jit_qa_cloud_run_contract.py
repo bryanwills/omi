@@ -408,6 +408,12 @@ def test_workflow_is_manual_main_only_and_cannot_reach_prod_or_scheduler():
     assert "workflow_dispatch:" in text
     assert '"refs/heads/main"' in text
     assert '[[ "${GITHUB_REF}"' in text
+    assert 'main_sha="$(git rev-parse --verify refs/remotes/origin/main)"' in text
+    assert 'git cat-file -e "${RELEASE_SHA}^{commit}"' in text
+    assert 'git merge-base --is-ancestor "$RELEASE_SHA" "$main_sha"' in text
+    assert "verify_backend_release_admission.py" in text
+    assert "--require-first-attempt" in text
+    assert '[[ "$RELEASE_SHA" == "$(git rev-parse --verify refs/remotes/origin/main)" ]]' not in text
     assert "based-hardware-dev" in text
     assert "backend-jit-qa" in text
     assert "desktop-backend-jit-qa" in text
@@ -433,6 +439,19 @@ def test_workflow_is_manual_main_only_and_cannot_reach_prod_or_scheduler():
     assert "gcr.io/${QA_PROJECT}" in text
     assert "vars.GCP_PROJECT_ID" not in text
     assert "environment: prod" not in text
+
+
+def test_qa_workflows_admit_only_proven_merged_ancestors():
+    for workflow in (WORKFLOW, TYPESENSE_WORKFLOW):
+        text = workflow.read_text(encoding="utf-8")
+        admit = text[text.index("  admit:") : text.index("\n  build:")]
+        assert '[[ "${GITHUB_REF}" == "refs/heads/main" ]]' in admit
+        assert 'main_sha="$(git rev-parse --verify refs/remotes/origin/main)"' in admit
+        assert 'git cat-file -e "${RELEASE_SHA}^{commit}"' in admit
+        assert 'git merge-base --is-ancestor "$RELEASE_SHA" "$main_sha"' in admit
+        assert "verify_backend_release_admission.py" in admit
+        assert "--require-first-attempt" in admit
+        assert '[[ "$RELEASE_SHA" == "$(git rev-parse --verify refs/remotes/origin/main)" ]]' not in admit
 
 
 def test_typesense_workflow_smokes_images_before_publish_and_has_unready_bootstrap():
