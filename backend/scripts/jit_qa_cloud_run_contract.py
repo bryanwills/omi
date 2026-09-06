@@ -283,7 +283,14 @@ def validate_cloud_run_resource(
             if actual_binding != expected_secret_bindings[name]:
                 raise JITQAContractError(f"Cloud Run resource has an unexpected secret binding for {name}")
         elif name in expected_environment:
-            if set(entry) != {"name", "value"} or entry.get("value") != expected_environment[name]:
+            # Cloud Run's REST representation omits the protobuf scalar for
+            # an explicitly configured empty environment value. Accept that
+            # representation only for an expected empty literal; retain
+            # exact matching for every value and reject null values.
+            expected_value = expected_environment[name]
+            if expected_value == "" and set(entry) == {"name"}:
+                continue
+            if set(entry) != {"name", "value"} or entry["value"] != expected_value:
                 raise JITQAContractError(f"Cloud Run resource has an unexpected value for {name}")
         else:
             # A replacement env update is intentional: silently retaining a
@@ -349,6 +356,7 @@ def resource_environment(
                 **identity,
                 "MEMORY_ENABLED": "on",
                 "MEMORY_BELIEF_MODEL_ENABLED": "true",
+                "OMI_JIT_PROACTIVITY_BUDGET_CONTRACT": "jit-cloud-qa-v1",
                 "OMI_JIT_QA_AUTH_ONLY": "true",
                 "OMI_JIT_QA_UID_ALLOWLIST": QA_UID,
                 "OMI_LLM_GATEWAY_FEATURE_MODE": "gateway",
@@ -369,6 +377,7 @@ def resource_environment(
                 "OMI_LLM_GATEWAY_PROD": "false",
                 "LLM_GATEWAY_ALLOWED_CALLERS": "backend,desktop",
                 "OMI_LLM_GATEWAY_BUILD_IDENTITY": "jit-qa",
+                "OMI_JIT_PROACTIVITY_BUDGET_CONTRACT": "jit-cloud-qa-v1",
             },
             {
                 **_GATEWAY_SECRET_BINDINGS,
