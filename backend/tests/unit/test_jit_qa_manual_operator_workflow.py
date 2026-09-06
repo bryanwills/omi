@@ -76,6 +76,28 @@ def test_manual_operator_uses_existing_seed_contract_without_deploying_resources
     assert "resumed first-page fixture/control check failed" in text
 
 
+def test_sweep_verify_joins_server_run_to_real_job_and_content_free_output():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    step = _step("Execute one bounded QA sweep and verify durable output")
+    command = step["run"]
+    assert step["if"] == "${{ inputs.operation == 'sweep-verify' }}"
+    assert "server_run_id=\"qa-sweep-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}\"" in command
+    assert 'OMI_JIT_QA_SWEEP_RUN_ID="$server_run_id"' in command
+    assert "run jobs execute \"$QA_SWEEP_JOB\"" in command
+    assert "--async" in command
+    assert "GCLOUD_PROJECT=$QA_PROJECT" in command
+    assert "gcloud_bounded run services describe \"$QA_GATEWAY_SERVICE\"" in command
+    assert "gcloud_bounded redis instances describe \"$QA_REDIS_INSTANCE\"" in command
+    assert '--run-id "$server_run_id" verify' in command
+    assert "validate-job" in command
+    assert "--expected-image \"$resolved_image\"" in command
+    assert 'operator-receipt.json' in command
+    assert 'rm -f "$operator_dir"/*.json' in command
+    assert "notification" not in command.casefold()
+    assert '"scheduler_mutation": False' in command
+    assert "poll_deadline" in command
+
+
 def test_every_workflow_shell_block_is_valid_bash():
     for step in _workflow_steps():
         command = step.get("run")
