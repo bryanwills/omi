@@ -28,6 +28,15 @@ DESKTOP_BACKEND_SERVICE = "desktop-backend-jit-qa"
 LEDGER_DRAIN_JOB = "knowledge-ledger-drain-qa-job"
 DAILY_SWEEP_JOB = "daily-memory-sweep-qa-job"
 LLM_GATEWAY_SERVICE = "llm-gateway-jit-qa"
+TYPESENSE_SERVICE = "typesense-jit-qa"
+TYPESENSE_API_SECRET = "jit-qa-typesense-api-key"
+TYPESENSE_COLLECTION = "jit_qa_canonical_memory_atoms"
+TYPESENSE_READINESS_COLLECTION = "jit_qa_typesense_readiness"
+TYPESENSE_ENTRYPOINT = "/usr/local/bin/jit-qa-typesense-entrypoint"
+TYPESENSE_CPU = "1"
+TYPESENSE_MEMORY = "1Gi"
+TYPESENSE_MIN_INSTANCES = 1
+TYPESENSE_MAX_INSTANCES = 1
 
 # This is the existing named-app identity that can authenticate through the
 # normal Firebase Auth project.  The cloud plane owns only this UID and uses
@@ -43,9 +52,19 @@ LEDGER_DRAIN_DOCKERFILE = "backend/modal/Dockerfile.knowledge_ledger_drain_job"
 DAILY_SWEEP_DOCKERFILE = "backend/modal/Dockerfile.daily_memory_sweep_job"
 DEFAULT_GATEWAY_URL = "https://llm-gateway-jit-qa.invalid"
 DEFAULT_REDIS_HOST = "10.0.0.10"
+DEFAULT_TYPESENSE_HOST = "typesense-jit-qa-1031333818730.us-central1.run.app"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_IMAGE_RE = re.compile(r"^gcr\.io/based-hardware-dev/[a-z0-9-]+@sha256:[0-9a-f]{64}$")
+_TYPESENSE_BASE_IMAGE_RE = re.compile(r"^docker\.io/typesense/typesense@sha256:[0-9a-f]{64}$")
+# Cloud Run emits either the regional hostname or the newer hashed ``uc.a``
+# hostname. Both are scoped to the explicitly named QA service.
+_TYPESENSE_HOST_RE = re.compile(r"^typesense-jit-qa-(?:[a-z0-9-]+-uc\.a\.run\.app|[0-9]+\.us-central1\.run\.app)$")
+# Cloud Run's QA service is linux/amd64. This is the reviewed 27.1
+# manifest-list digest, so a dispatch cannot silently select another release.
+TYPESENSE_BASE_IMAGE_27_1 = (
+    "docker.io/typesense/typesense@sha256:5c12af89130b8ee0be11541321ba8a3a7c7a538d7c6cd95e0409dc2d75ca6455"
+)
 _FORBIDDEN_CREDENTIAL_ENV = frozenset(
     {
         "SERVICE_ACCOUNT_JSON",
@@ -66,6 +85,7 @@ _ALLOWED_SECRET_BINDINGS = {
     "POSTHOG_PROJECT_API_KEY": "POSTHOG_PROJECT_API_KEY:latest",
     "REDIS_DB_PASSWORD": "jit-qa-redis-password:latest",
     "OMI_LLM_GATEWAY_SERVICE_TOKEN": "jit-qa-gateway-token:latest",
+    "TYPESENSE_API_KEY": "jit-qa-typesense-api-key:latest",
 }
 _GATEWAY_SECRET_BINDINGS = {
     "OPENAI_API_KEY": "OPENAI_API_KEY:latest",
@@ -80,6 +100,12 @@ class JITQAContractError(ValueError):
     """The proposed QA execution crosses an isolation or rollout boundary."""
 
 
+def is_valid_typesense_qa_host(host: str) -> bool:
+    """Return whether ``host`` is one of the named service's Cloud Run forms."""
+
+    return bool(_TYPESENSE_HOST_RE.fullmatch(host))
+
+
 def require_sha(value: str, *, label: str) -> None:
     if not _SHA_RE.fullmatch(value):
         raise JITQAContractError(f"{label} must be a full lowercase 40-character SHA")
@@ -88,6 +114,47 @@ def require_sha(value: str, *, label: str) -> None:
 def require_digest_image(value: str, *, label: str) -> None:
     if not _DIGEST_IMAGE_RE.fullmatch(value):
         raise JITQAContractError(f"{label} must be a dev GCR image pinned by sha256 digest")
+
+
+def require_typesense_base_image(value: str, *, label: str = "Typesense base image") -> None:
+    """Require the reviewed upstream Typesense image to be immutable.
+
+    The workflow wraps this image in a small checked-in entrypoint before
+    publishing it to the development registry.  Keeping the Docker Hub
+    identity narrow prevents a dispatch input from selecting an arbitrary
+    container image.
+    """
+
+    if not _TYPESENSE_BASE_IMAGE_RE.fullmatch(value):
+        raise JITQAContractError(f"{label} must be docker.io/typesense/typesense pinned by sha256 digest")
+    if value != TYPESENSE_BASE_IMAGE_27_1:
+        raise JITQAContractError(f"{label} must be the reviewed Typesense 27.1 digest")
+
+
+def validate_typesense_workflow_configuration(
+    *,
+    project: str,
+    region: str,
+    auth_project: str,
+    uid: str,
+    database: str,
+    base_image: str,
+    source_sha: str,
+) -> None:
+    """Validate the target of the standalone lexical projection workflow."""
+
+    if project != PROJECT_ID:
+        raise JITQAContractError(f"Typesense QA project must be {PROJECT_ID}")
+    if region != REGION:
+        raise JITQAContractError(f"Typesense QA region must be {REGION}")
+    if auth_project != AUTH_PROJECT_ID:
+        raise JITQAContractError(f"Typesense QA auth project must be {AUTH_PROJECT_ID}")
+    if uid != QA_UID:
+        raise JITQAContractError("Typesense QA UID must be the fixed isolated test identity")
+    if database != FIRESTORE_DATABASE_ID:
+        raise JITQAContractError("Typesense QA Firestore database must be jit-qa")
+    require_typesense_base_image(base_image)
+    require_sha(source_sha, label="source_sha")
 
 
 def validate_static_configuration(
@@ -166,9 +233,20 @@ def validate_environment(environment: Mapping[str, str], *, profile: str) -> Non
         raise JITQAContractError(f"environment does not match the {profile} QA profile")
 
 
-def validate_qa_http_environment(environment: Mapping[str, str], *, gateway_url: str, redis_host: str) -> None:
+def validate_qa_http_environment(
+    environment: Mapping[str, str],
+    *,
+    gateway_url: str,
+    redis_host: str,
+    typesense_host: str = DEFAULT_TYPESENSE_HOST,
+    typesense_source_sha: str = "",
+) -> None:
     """Require the isolated HTTP service to use the QA auth, gateway and cache."""
 
+    if not is_valid_typesense_qa_host(typesense_host):
+        raise JITQAContractError("TYPESENSE_HOST must be the named isolated QA Cloud Run host")
+    if typesense_source_sha:
+        require_sha(typesense_source_sha, label="MEMORY_TYPESENSE_READINESS_SOURCE_SHA")
     expected = {
         "OMI_JIT_QA_AUTH_ONLY": "true",
         "OMI_JIT_QA_UID_ALLOWLIST": QA_UID,
@@ -178,7 +256,15 @@ def validate_qa_http_environment(environment: Mapping[str, str], *, gateway_url:
         "OMI_LLM_GATEWAY_URL": gateway_url,
         "REDIS_DB_HOST": redis_host,
         "REDIS_DB_PORT": "6379",
+        "TYPESENSE_HOST": typesense_host,
+        "TYPESENSE_HOST_PORT": "443",
+        "TYPESENSE_PROTOCOL": "https",
+        "MEMORY_TYPESENSE_COLLECTION": TYPESENSE_COLLECTION,
+        "MEMORY_TYPESENSE_READINESS_REQUIRED": "true",
+        "MEMORY_TYPESENSE_READINESS_COLLECTION": TYPESENSE_READINESS_COLLECTION,
     }
+    if typesense_source_sha:
+        expected["MEMORY_TYPESENSE_READINESS_SOURCE_SHA"] = typesense_source_sha
     for name, value in expected.items():
         if environment.get(name) != value:
             raise JITQAContractError(f"{name} must be the isolated QA value")
@@ -236,6 +322,8 @@ def validate_cloud_run_resource(
     expected_service_account: str = RUNTIME_SERVICE_ACCOUNT,
     gateway_url: str | None = None,
     redis_host: str | None = None,
+    typesense_host: str | None = None,
+    typesense_source_sha: str = "",
 ) -> None:
     """Validate a post-deploy Cloud Run describe result without printing secrets."""
 
@@ -305,7 +393,13 @@ def validate_cloud_run_resource(
             for entry in container.get("env", [])
             if isinstance(entry, dict) and "name" in entry and "value" in entry
         }
-        validate_qa_http_environment(actual_environment, gateway_url=gateway_url, redis_host=redis_host)
+        validate_qa_http_environment(
+            actual_environment,
+            gateway_url=gateway_url,
+            redis_host=redis_host,
+            typesense_host=typesense_host or DEFAULT_TYPESENSE_HOST,
+            typesense_source_sha=typesense_source_sha,
+        )
 
     spec = resource.get("spec")
     if not isinstance(spec, Mapping):
@@ -335,11 +429,147 @@ def validate_cloud_run_resource(
         raise JITQAContractError("Cloud Run resource uses an unexpected runtime service account")
 
 
+def validate_typesense_cloud_run_resource(
+    resource: Mapping[str, Any],
+    *,
+    expected_image: str,
+    expected_name: str = TYPESENSE_SERVICE,
+    expected_service_account: str = RUNTIME_SERVICE_ACCOUNT,
+) -> None:
+    """Validate the single-container, single-instance Typesense service.
+
+    This intentionally has a separate contract from the application profiles:
+    Typesense receives no Firestore or customer credentials.  Its only secret
+    is the QA API key, and its ephemeral filesystem is rehydrated by the proof
+    script after a restart.
+    """
+
+    require_digest_image(expected_image, label="expected Typesense image")
+    metadata = resource.get("metadata")
+    if not isinstance(metadata, Mapping) or metadata.get("name") != expected_name:
+        raise JITQAContractError("Typesense service name does not match the admitted QA name")
+    spec = resource.get("spec")
+    if not isinstance(spec, Mapping):
+        raise JITQAContractError("Typesense resource has no v2 spec")
+    template = spec.get("template")
+    if not isinstance(template, Mapping):
+        raise JITQAContractError("Typesense resource has no v2 service template")
+    service_template = template.get("spec", template)
+    if not isinstance(service_template, Mapping):
+        raise JITQAContractError("Typesense service template is malformed")
+    containers = service_template.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], Mapping):
+        raise JITQAContractError("Typesense service must have exactly one application container")
+    container = containers[0]
+    if container.get("image") != expected_image:
+        raise JITQAContractError("Typesense service image does not match the admitted digest")
+    if container.get("command") != [TYPESENSE_ENTRYPOINT]:
+        raise JITQAContractError("Typesense service must use the checked-in QA entrypoint")
+    if container.get("args", []) != []:
+        raise JITQAContractError("Typesense service must not override the checked-in entrypoint arguments")
+
+    expected_env = {"TYPESENSE_DATA_DIR": "/tmp/typesense"}
+    expected_secret = {"TYPESENSE_API_KEY": f"{TYPESENSE_API_SECRET}:latest"}
+    expected_names = set(expected_env) | set(expected_secret)
+    seen_names: set[str] = set()
+    for entry in container.get("env", []):
+        if not isinstance(entry, Mapping):
+            raise JITQAContractError("Typesense environment entry is malformed")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name or name in seen_names:
+            raise JITQAContractError("Typesense environment names must be unique and non-empty")
+        seen_names.add(name)
+        wrappers = [wrapper for wrapper in ("valueFrom", "valueSource") if wrapper in entry]
+        if len(wrappers) > 1 or (wrappers and "value" in entry):
+            raise JITQAContractError(f"Typesense environment binding is ambiguous for {name}")
+        if wrappers:
+            if name not in expected_secret:
+                raise JITQAContractError(f"Typesense has an unapproved secret binding for {name}")
+            wrapper = wrappers[0]
+            value_source = entry.get(wrapper)
+            if not isinstance(value_source, Mapping) or set(value_source) != {"secretKeyRef"}:
+                raise JITQAContractError(f"Typesense secret binding is malformed for {name}")
+            secret_ref = value_source.get("secretKeyRef")
+            if not isinstance(secret_ref, Mapping):
+                raise JITQAContractError(f"Typesense secret binding is malformed for {name}")
+            if wrapper == "valueFrom":
+                if set(secret_ref) != {"name", "key"}:
+                    raise JITQAContractError(f"Typesense secret binding is malformed for {name}")
+                actual = f"{secret_ref.get('name', '')}:{secret_ref.get('key', '')}"
+            else:
+                if set(secret_ref) != {"secret", "version"}:
+                    raise JITQAContractError(f"Typesense secret binding is malformed for {name}")
+                actual = f"{secret_ref.get('secret', '')}:{secret_ref.get('version', '')}"
+            if actual != expected_secret[name]:
+                raise JITQAContractError(f"Typesense secret binding is not the dedicated QA key for {name}")
+        elif name in expected_env:
+            if set(entry) != {"name", "value"} or entry.get("value") != expected_env[name]:
+                raise JITQAContractError(f"Typesense has an unexpected value for {name}")
+        else:
+            raise JITQAContractError(f"Typesense has an unapproved environment entry for {name}")
+    missing = expected_names - seen_names
+    if missing:
+        raise JITQAContractError(f"Typesense is missing required environment entries: {sorted(missing)}")
+
+    scaling = service_template.get("scaling", template.get("scaling"))
+    if isinstance(scaling, Mapping):
+        min_instances = scaling.get("minInstanceCount")
+        max_instances = scaling.get("maxInstanceCount")
+    else:
+        # ``gcloud run services describe`` exposes service-level ``--min`` /
+        # ``--max`` as run.googleapis.com annotations. Older v1-shaped
+        # resources put the equivalent Knative annotations on the template.
+        resource_annotations = metadata.get("annotations") if isinstance(metadata, Mapping) else None
+        template_metadata = template.get("metadata")
+        template_annotations = template_metadata.get("annotations") if isinstance(template_metadata, Mapping) else None
+        annotations = resource_annotations if isinstance(resource_annotations, Mapping) else None
+        if not isinstance(annotations, Mapping) or not any(
+            key in annotations for key in ("run.googleapis.com/minScale", "run.googleapis.com/maxScale")
+        ):
+            annotations = template_annotations
+        if not isinstance(annotations, Mapping):
+            raise JITQAContractError("Typesense service must declare explicit min/max instance bounds")
+        min_instances = annotations.get(
+            "run.googleapis.com/minScale", annotations.get("autoscaling.knative.dev/minScale")
+        )
+        max_instances = annotations.get(
+            "run.googleapis.com/maxScale", annotations.get("autoscaling.knative.dev/maxScale")
+        )
+        try:
+            if min_instances is not None:
+                min_instances = int(min_instances)
+            if max_instances is not None:
+                max_instances = int(max_instances)
+        except (TypeError, ValueError) as exc:
+            raise JITQAContractError("Typesense service has invalid autoscaling bounds") from exc
+    if min_instances != TYPESENSE_MIN_INSTANCES:
+        raise JITQAContractError("Typesense service must keep one warm instance for restart rehydration")
+    if max_instances != TYPESENSE_MAX_INSTANCES:
+        raise JITQAContractError("Typesense service must be bounded to one instance")
+    resources = container.get("resources")
+    limits = resources.get("limits") if isinstance(resources, Mapping) else None
+    if not isinstance(limits, Mapping):
+        raise JITQAContractError("Typesense service must declare CPU and memory limits")
+    if limits.get("cpu") not in {TYPESENSE_CPU, "1000m"} or limits.get("memory") not in {
+        TYPESENSE_MEMORY,
+        "1024Mi",
+    }:
+        raise JITQAContractError("Typesense service must use the bounded 1 CPU / 1 GiB profile")
+    service_account = service_template.get(
+        "serviceAccountName",
+        service_template.get("serviceAccount", template.get("serviceAccountName", template.get("serviceAccount"))),
+    )
+    if service_account != expected_service_account:
+        raise JITQAContractError("Typesense service uses an unexpected runtime service account")
+
+
 def resource_environment(
     profile: str,
     *,
     gateway_url: str = DEFAULT_GATEWAY_URL,
     redis_host: str = DEFAULT_REDIS_HOST,
+    typesense_host: str = DEFAULT_TYPESENSE_HOST,
+    typesense_source_sha: str = "",
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Return the exact literal and Secret Manager bindings for a QA profile."""
 
@@ -351,6 +581,20 @@ def resource_environment(
         "FIREBASE_AUTH_PROJECT_ID": AUTH_PROJECT_ID,
     }
     if profile in {"backend", "desktop"}:
+        if not is_valid_typesense_qa_host(typesense_host):
+            raise JITQAContractError("TYPESENSE_HOST must be the named isolated QA Cloud Run host")
+        if typesense_source_sha:
+            require_sha(typesense_source_sha, label="MEMORY_TYPESENSE_READINESS_SOURCE_SHA")
+        typesense_environment = {
+            "TYPESENSE_HOST": typesense_host,
+            "TYPESENSE_HOST_PORT": "443",
+            "TYPESENSE_PROTOCOL": "https",
+            "MEMORY_TYPESENSE_COLLECTION": TYPESENSE_COLLECTION,
+            "MEMORY_TYPESENSE_READINESS_REQUIRED": "true",
+            "MEMORY_TYPESENSE_READINESS_COLLECTION": TYPESENSE_READINESS_COLLECTION,
+        }
+        if typesense_source_sha:
+            typesense_environment["MEMORY_TYPESENSE_READINESS_SOURCE_SHA"] = typesense_source_sha
         return (
             {
                 **identity,
@@ -365,6 +609,7 @@ def resource_environment(
                 "OMI_LLM_GATEWAY_URL": gateway_url,
                 "REDIS_DB_HOST": redis_host,
                 "REDIS_DB_PORT": "6379",
+                **typesense_environment,
             },
             dict(_ALLOWED_SECRET_BINDINGS),
         )
@@ -432,7 +677,10 @@ def resource_environment(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "environment", "execution", "resource"))
+    parser.add_argument(
+        "command",
+        choices=("validate", "environment", "execution", "resource", "typesense", "typesense-resource"),
+    )
     parser.add_argument("--project", default=PROJECT_ID)
     parser.add_argument("--region", default=REGION)
     parser.add_argument("--auth-project", default=AUTH_PROJECT_ID)
@@ -449,8 +697,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=("backend", "desktop", "gateway", "drain", "sweep"))
     parser.add_argument("--expected-image")
     parser.add_argument("--expected-name")
+    parser.add_argument("--database", default=FIRESTORE_DATABASE_ID)
+    parser.add_argument("--base-image")
+    parser.add_argument("--source-sha")
     parser.add_argument("--gateway-url", default=DEFAULT_GATEWAY_URL)
     parser.add_argument("--redis-host", default=DEFAULT_REDIS_HOST)
+    parser.add_argument("--typesense-host", default=DEFAULT_TYPESENSE_HOST)
     return parser.parse_args()
 
 
@@ -491,6 +743,25 @@ def main() -> int:
                 confirmation=args.confirmation,
                 kill_switch=args.sweep_kill_switch,
             )
+        elif args.command == "typesense":
+            if args.base_image is None or args.source_sha is None:
+                raise JITQAContractError("Typesense validation requires --base-image and --source-sha")
+            validate_typesense_workflow_configuration(
+                project=args.project,
+                region=args.region,
+                auth_project=args.auth_project,
+                uid=args.uid,
+                database=args.database,
+                base_image=args.base_image,
+                source_sha=args.source_sha,
+            )
+        elif args.command == "typesense-resource":
+            if args.resource_json is None or args.expected_image is None:
+                raise JITQAContractError("Typesense resource validation requires --resource-json and --expected-image")
+            resource = json.loads(args.resource_json.read_text(encoding="utf-8"))
+            if not isinstance(resource, dict):
+                raise JITQAContractError("Cloud Run resource JSON must be an object")
+            validate_typesense_cloud_run_resource(resource, expected_image=args.expected_image)
         else:
             if args.resource_json is None or args.kind is None or args.expected_image is None:
                 raise JITQAContractError("resource validation requires --resource-json, --kind, and --expected-image")
@@ -500,7 +771,11 @@ def main() -> int:
             if args.profile is None:
                 raise JITQAContractError("resource validation requires --profile")
             expected_environment, expected_secret_bindings = resource_environment(
-                args.profile, gateway_url=args.gateway_url, redis_host=args.redis_host
+                args.profile,
+                gateway_url=args.gateway_url,
+                redis_host=args.redis_host,
+                typesense_host=args.typesense_host,
+                typesense_source_sha=args.source_sha or "",
             )
             validate_cloud_run_resource(
                 resource,
@@ -511,6 +786,8 @@ def main() -> int:
                 expected_name=args.expected_name,
                 gateway_url=args.gateway_url if args.profile in {"backend", "desktop"} else None,
                 redis_host=args.redis_host if args.profile in {"backend", "desktop"} else None,
+                typesense_host=args.typesense_host if args.profile in {"backend", "desktop"} else None,
+                typesense_source_sha=args.source_sha or "",
             )
     except (JITQAContractError, OSError, json.JSONDecodeError) as exc:
         print(f"JIT QA contract failed: {exc}", file=sys.stderr)

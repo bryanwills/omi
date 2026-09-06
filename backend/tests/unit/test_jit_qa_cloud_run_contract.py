@@ -1,5 +1,10 @@
 import importlib.util
 import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -7,6 +12,7 @@ import pytest
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = BACKEND_ROOT / "scripts" / "jit_qa_cloud_run_contract.py"
 WORKFLOW = BACKEND_ROOT.parent / ".github" / "workflows" / "jit_qa_cloud_run.yml"
+TYPESENSE_WORKFLOW = BACKEND_ROOT.parent / ".github" / "workflows" / "jit_qa_typesense_projection.yml"
 
 
 def _load_contract():
@@ -273,6 +279,124 @@ def test_gateway_resource_is_fenced_to_the_fixed_qa_uid():
     assert literals["OMI_JIT_QA_UID_ALLOWLIST"] == CONTRACT.QA_UID
 
 
+def _typesense_resource(image: str) -> dict:
+    return {
+        "metadata": {"name": CONTRACT.TYPESENSE_SERVICE},
+        "spec": {
+            "template": {
+                "serviceAccountName": CONTRACT.RUNTIME_SERVICE_ACCOUNT,
+                "scaling": {
+                    "minInstanceCount": CONTRACT.TYPESENSE_MIN_INSTANCES,
+                    "maxInstanceCount": CONTRACT.TYPESENSE_MAX_INSTANCES,
+                },
+                "containers": [
+                    {
+                        "image": image,
+                        "command": [CONTRACT.TYPESENSE_ENTRYPOINT],
+                        "args": [],
+                        "env": [
+                            {"name": "TYPESENSE_DATA_DIR", "value": "/tmp/typesense"},
+                            {
+                                "name": "TYPESENSE_API_KEY",
+                                "valueSource": {
+                                    "secretKeyRef": {
+                                        "secret": CONTRACT.TYPESENSE_API_SECRET,
+                                        "version": "latest",
+                                    }
+                                },
+                            },
+                        ],
+                        "resources": {
+                            "limits": {
+                                "cpu": CONTRACT.TYPESENSE_CPU,
+                                "memory": CONTRACT.TYPESENSE_MEMORY,
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+
+def test_typesense_workflow_is_pinned_to_named_dev_firestore_and_immutable_base():
+    CONTRACT.validate_typesense_workflow_configuration(
+        project="based-hardware-dev",
+        region="us-central1",
+        auth_project="based-hardware",
+        uid=CONTRACT.QA_UID,
+        database="jit-qa",
+        base_image=CONTRACT.TYPESENSE_BASE_IMAGE_27_1,
+        source_sha="b" * 40,
+    )
+    with pytest.raises(CONTRACT.JITQAContractError):
+        CONTRACT.validate_typesense_workflow_configuration(
+            project="based-hardware",
+            region="us-central1",
+            auth_project="based-hardware",
+            uid=CONTRACT.QA_UID,
+            database="jit-qa",
+            base_image="docker.io/typesense/typesense@sha256:" + "a" * 64,
+            source_sha="b" * 40,
+        )
+    with pytest.raises(CONTRACT.JITQAContractError, match="reviewed Typesense 27.1 digest"):
+        CONTRACT.validate_typesense_workflow_configuration(
+            project="based-hardware-dev",
+            region="us-central1",
+            auth_project="based-hardware",
+            uid=CONTRACT.QA_UID,
+            database="jit-qa",
+            base_image="docker.io/typesense/typesense@sha256:" + "a" * 64,
+            source_sha="b" * 40,
+        )
+
+
+def test_typesense_resource_requires_single_bounded_container_and_dedicated_key():
+    image = "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "e" * 64
+    resource = _typesense_resource(image)
+    CONTRACT.validate_typesense_cloud_run_resource(resource, expected_image=image)
+    resource["spec"]["template"]["scaling"]["maxInstanceCount"] = 2
+    with pytest.raises(CONTRACT.JITQAContractError, match="bounded to one instance"):
+        CONTRACT.validate_typesense_cloud_run_resource(resource, expected_image=image)
+
+
+def test_typesense_resource_rejects_extra_environment():
+    image = "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "f" * 64
+    resource = _typesense_resource(image)
+    resource["spec"]["template"]["containers"][0]["env"].append(
+        {"name": "GOOGLE_CLOUD_PROJECT", "value": "based-hardware"}
+    )
+    with pytest.raises(CONTRACT.JITQAContractError, match="unapproved environment"):
+        CONTRACT.validate_typesense_cloud_run_resource(resource, expected_image=image)
+
+
+def test_typesense_resource_accepts_v1_autoscaling_annotations():
+    image = "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "f" * 64
+    resource = _typesense_resource(image)
+    template = resource["spec"]["template"]
+    template["metadata"] = {
+        "annotations": {
+            "autoscaling.knative.dev/minScale": "1",
+            "autoscaling.knative.dev/maxScale": "1",
+        }
+    }
+    template.pop("scaling")
+    CONTRACT.validate_typesense_cloud_run_resource(resource, expected_image=image)
+
+
+def test_typesense_resource_accepts_cloud_run_service_level_scaling_and_cpu_encoding():
+    image = "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "f" * 64
+    resource = _typesense_resource(image)
+    template = resource["spec"]["template"]
+    template.pop("scaling")
+    resource["metadata"]["annotations"] = {
+        "run.googleapis.com/minScale": "1",
+        "run.googleapis.com/maxScale": "1",
+    }
+    template["containers"][0]["resources"]["limits"]["cpu"] = "1000m"
+    CONTRACT.validate_typesense_cloud_run_resource(resource, expected_image=image)
+
+
 @pytest.mark.parametrize("profile", ("backend", "desktop", "drain", "sweep"))
 def test_rollout_profiles_require_the_real_posthog_control_plane_secret(profile):
     _, secrets = CONTRACT.resource_environment(profile)
@@ -311,6 +435,21 @@ def test_workflow_is_manual_main_only_and_cannot_reach_prod_or_scheduler():
     assert "environment: prod" not in text
 
 
+def test_typesense_workflow_smokes_images_before_publish_and_has_unready_bootstrap():
+    text = TYPESENSE_WORKFLOW.read_text(encoding="utf-8")
+    assert "mode:" in text
+    assert "- bootstrap" in text and "- prove" in text
+    assert "docker run --detach --name \"$smoke_name\"" in text
+    assert "unauthenticated_status" in text
+    assert '"$smoke_url/collections/jit_qa_smoke/documents/export?include_fields=id,content"' in text
+    assert 'scripts/jit_qa_typesense_projection.py --help' in text
+    assert "if: ${{ inputs.mode == 'prove' }}" in text
+    assert "if: ${{ inputs.mode == 'bootstrap' }}" in text
+    assert '"status": "not_qualified"' in text
+    assert '"readiness_marker": "absent"' in text
+    assert "group: jit-isolated-qa-cloud-run-development" in text
+
+
 def test_bounded_proactivity_capability_is_required_on_qa_http_and_gateway_only():
     key = "OMI_JIT_PROACTIVITY_BUDGET_CONTRACT"
     for profile in ("backend", "desktop", "gateway"):
@@ -319,3 +458,93 @@ def test_bounded_proactivity_capability_is_required_on_qa_http_and_gateway_only(
     for profile in ("drain", "sweep"):
         literals, _ = CONTRACT.resource_environment(profile)
         assert key not in literals
+
+
+def test_qa_cloud_run_rendered_typesense_shell_accepts_real_host_and_digest():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    start = 'typesense_image="$(python3 - "$typesense_resource" "$SOURCE_SHA" "$typesense_host" "$expected_typesense_image" <<\'PY\''
+    rendered = text.split(start, 1)[1].split("\n          PY", 1)[0]
+    rendered = textwrap.dedent(rendered.lstrip("\n"))
+    image = "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "a" * 64
+    resource = {
+        "metadata": {"labels": {"managed-by": "github-actions", "jit-qa": "true", "source-sha": "b" * 40}},
+        "spec": {
+            "template": {
+                "spec": {"containers": [{"image": image}]},
+            }
+        },
+    }
+    for host in (
+        "typesense-jit-qa-1031333818730.us-central1.run.app",
+        "typesense-jit-qa-dt5lrfkkoa-uc.a.run.app",
+    ):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as file:
+            json.dump(resource, file)
+            file.flush()
+            result = subprocess.run(
+                [sys.executable, "-", file.name, "b" * 40, host, image],
+                input=rendered,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == image
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8") as file:
+        json.dump(resource, file)
+        file.flush()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-",
+                file.name,
+                "b" * 40,
+                "typesense-jit-qa-1031333818730.us-central1.run.app",
+                "gcr.io/based-hardware-dev/typesense-jit-qa@sha256:" + "c" * 64,
+            ],
+            input=rendered,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    assert result.returncode != 0
+    assert "source-SHA registry digest" in result.stderr
+
+
+def test_qa_cloud_run_renders_typesense_host_and_key_into_both_http_services():
+    text = WORKFLOW.read_text(encoding="utf-8")
+    common_line = next(line.strip() for line in text.splitlines() if line.strip().startswith("common=\"^@^"))
+    env = {
+        "QA_PROJECT": "based-hardware-dev",
+        "QA_FIRESTORE_DATABASE": "jit-qa",
+        "QA_AUTH_PROJECT": "based-hardware",
+        "QA_UID": CONTRACT.QA_UID,
+        "QA_TYPESENSE_COLLECTION": CONTRACT.TYPESENSE_COLLECTION,
+        "QA_TYPESENSE_READINESS_COLLECTION": CONTRACT.TYPESENSE_READINESS_COLLECTION,
+        "GATEWAY_URL": "https://llm-gateway-jit-qa-abc.run.app",
+        "REDIS_HOST": "10.0.0.10",
+        "TYPESENSE_HOST": "typesense-jit-qa-1031333818730.us-central1.run.app",
+        "SOURCE_SHA": "b" * 40,
+    }
+    rendered = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{common_line}\nprintf '%s' \"$common\""],
+        env={**os.environ, **env},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    common = rendered.stdout
+    assert "@TYPESENSE_HOST=typesense-jit-qa-1031333818730.us-central1.run.app@" in common
+    assert "@MEMORY_TYPESENSE_COLLECTION=jit_qa_canonical_memory_atoms@" in common
+    assert "@MEMORY_TYPESENSE_READINESS_SOURCE_SHA=" + "b" * 40 in common
+    deploy_line = next(line for line in text.splitlines() if "--set-secrets" in line and "TYPESENSE_API_KEY" in line)
+    assert 'for pair in "$QA_SERVICE:$BACKEND_IMAGE" "$QA_DESKTOP_SERVICE:$DESKTOP_IMAGE"' in text
+    assert "TYPESENSE_API_KEY=${QA_TYPESENSE_SECRET}:latest" in deploy_line
+
+
+def test_typesense_entrypoint_uses_environment_key_without_secret_argument():
+    entrypoint = (BACKEND_ROOT / "scripts" / "jit_qa_typesense_entrypoint.sh").read_text(encoding="utf-8")
+    assert "TYPESENSE_API_KEY" in entrypoint
+    assert "--api-key" not in entrypoint
