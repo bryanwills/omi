@@ -12,6 +12,7 @@ import type {
   QueryScopedOutbound,
   ResultMessage,
   WarmupMessage,
+  JitCostEvidenceProjection,
 } from "../protocol.js";
 import { PROTOCOL_VERSION } from "../protocol.js";
 import { serializeArtifact } from "./artifact-serialization.js";
@@ -19,6 +20,7 @@ import { failureFromError, normalizeRuntimeFailure, sanitizeProcessDiagnostic, t
 import type { AgentEvent, RunMode } from "./types.js";
 import { AgentRuntimeKernel, type ExecuteAgentRunInput } from "./kernel.js";
 import { kernelSystemPolicy } from "./context-snapshot.js";
+import { stableJsonHash } from "./kernel-support.js";
 
 export type JsonlTransportSend = (message: OutboundMessageDraft) => void;
 export type JsonlTransportLog = (message: string) => void;
@@ -60,6 +62,7 @@ export type RecoverableErrorHandler = (error: unknown, adapterId: string) => Pro
 export type QueryActivityLeaseScheduler = (emit: () => void) => () => void;
 
 const QUERY_ACTIVITY_LEASE_INTERVAL_MS = 15_000;
+const JIT_SOURCE_PROJECTION_SCHEMA_VERSION = "omi.jit.proactivity.source_projection.v1";
 
 function scheduleQueryActivityLease(emit: () => void): () => void {
   const timer = setInterval(emit, QUERY_ACTIVITY_LEASE_INTERVAL_MS);
@@ -128,7 +131,87 @@ const QUERY_WIRE_FIELDS = new Set([
   "reasoningEffort",
   "jitKnowledgeToolsEnabled",
   "jitBudget",
+  "jitCostEvidenceProjection",
 ]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function projectionStringValue(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`jit source projection ${field} is invalid`);
+  }
+  return value;
+}
+
+function admittedSourceProjection(
+  projection: unknown,
+  snapshot: ExecuteAgentRunInput["admittedContextSnapshot"],
+  executionID: string,
+  runPrompt: string,
+): JitCostEvidenceProjection | undefined {
+  if (projection === undefined) return undefined;
+  if (!snapshot) throw new Error("jit source projection requires an admitted context snapshot");
+  if (!isRecord(projection)) {
+    throw new Error("jit source projection must be an object");
+  }
+  if (projection.schema_version !== JIT_SOURCE_PROJECTION_SCHEMA_VERSION) {
+    throw new Error("jit source projection schema is unsupported");
+  }
+  const ownerID = projectionStringValue(projection.owner_id, "owner_id");
+  if (ownerID !== snapshot.ownerId) {
+    throw new Error("jit source projection owner does not match admitted context");
+  }
+  const projectionExecutionID = projectionStringValue(projection.execution_id, "execution_id");
+  if (projectionExecutionID !== executionID) {
+    throw new Error("jit source projection execution does not match JIT budget");
+  }
+  if (projection.producer_lane !== "planned" && projection.producer_lane !== "ambient") {
+    throw new Error("jit source projection lane is invalid");
+  }
+  if (!isRecord(projection.matched_input)) {
+    throw new Error("jit source projection matched input is invalid");
+  }
+  const matchedInput = projection.matched_input;
+  const evaluationTime = projectionStringValue(matchedInput.evaluation_time, "matched input evaluation time");
+  const timezone = projectionStringValue(matchedInput.timezone, "matched input timezone");
+  const contextID = projectionStringValue(matchedInput.context_id, "matched input context id");
+  for (const [stage, requiredFields] of [
+    ["legacy", ["prompt", "uncached_prompt"]],
+    ["nano", ["prompt"]],
+    ["full", ["prompt"]],
+  ] as const) {
+    const value = projection[stage];
+    if (!isRecord(value)) throw new Error(`jit source projection ${stage} is invalid`);
+    for (const field of requiredFields) {
+      projectionStringValue(value[field], `${stage}.${field}`);
+    }
+  }
+  if (
+    !evaluationTime.trim()
+    || !timezone.trim()
+    || !contextID.trim()
+  ) {
+    throw new Error("jit source projection matched input is incomplete");
+  }
+  const full = projection.full as Record<string, unknown>;
+  if (typeof full.prompt !== "string" || !full.prompt.trim()) {
+    throw new Error("jit source projection full prompt is missing");
+  }
+  if (full.prompt !== runPrompt) {
+    throw new Error("jit source projection full prompt does not match admitted run prompt");
+  }
+  const evidenceSHA256 = stableJsonHash(snapshot);
+  return {
+    ...(projection as JitCostEvidenceProjection),
+    evidence_sha256: evidenceSHA256,
+    matched_input: {
+      ...(matchedInput as JitCostEvidenceProjection["matched_input"]),
+      evidence_sha256: evidenceSHA256,
+    },
+  };
+}
 
 export class JsonlTransport {
   private readonly kernel: AgentRuntimeKernel;
@@ -501,6 +584,17 @@ export class JsonlTransport {
       throw new Error("context_snapshot_projection_mismatch");
     }
     const mode = message.mode ?? "act";
+    if (message.jitCostEvidenceProjection !== undefined && !message.jitBudget) {
+      throw new Error("jit source projection requires jitBudget");
+    }
+    const sourceProjection = message.jitBudget
+      ? admittedSourceProjection(
+        message.jitCostEvidenceProjection,
+        snapshot,
+        message.jitBudget.executionID,
+        message.prompt,
+      )
+      : undefined;
     const cwd = profile.workingDirectory || session.defaultCwd || this.defaultCwd();
     const executionRole = session.executionRole;
 
@@ -551,6 +645,7 @@ export class JsonlTransport {
       expectedContextSnapshotGeneration: message.expectedContextSnapshotGeneration,
       expectedContextRendererFingerprint: message.expectedContextRendererFingerprint,
       expectedCapabilityVersion: message.expectedCapabilityVersion,
+      ...(sourceProjection ? { jitCostEvidenceProjection: sourceProjection } : {}),
       metadata: {
         protocolVersion: PROTOCOL_VERSION,
         source: "jsonl_transport",
@@ -561,6 +656,7 @@ export class JsonlTransport {
         ...(message.reasoningEffort ? { reasoningEffort: message.reasoningEffort } : {}),
         ...(message.jitKnowledgeToolsEnabled === true ? { jitKnowledgeToolsEnabled: true } : {}),
         ...(message.jitBudget ? { jitBudget: message.jitBudget } : {}),
+        ...(sourceProjection ? { producerLane: sourceProjection.producer_lane } : {}),
       },
     };
   }
